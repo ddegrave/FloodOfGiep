@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>StormDefense — Prototype 3D (WebGL, Three.js)</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b1020; color:#e6eefc; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif; }
+    #app { position:fixed; inset:0; display:grid; grid-template-rows: 1fr auto; }
+    canvas { display:block; }
+    .hud { display:flex; gap:16px; align-items:center; padding:10px 14px; background:linear-gradient(180deg,rgba(10,15,30,.75),rgba(10,15,30,.35)); backdrop-filter: blur(6px); border-top:1px solid rgba(255,255,255,.06); }
+    .hud .box { display:flex; align-items:center; gap:8px; padding:8px 10px; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.08); border-radius:12px; }
+    button { background:#69d1c5; color:#04131a; border:none; padding:10px 14px; border-radius:12px; font-weight:700; cursor:pointer; transition:.2s transform; }
+    button:hover{ transform: translateY(-1px); }
+    button:disabled{ opacity:.6; cursor:not-allowed; }
+    .meter { width:220px; height:16px; background:rgba(255,255,255,.08); border-radius:999px; overflow:hidden; position:relative; }
+    .meter > i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#37a1f2,#67e8f9); }
+    .hint { position:fixed; left:12px; top:12px; padding:8px 10px; background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.08); border-radius:10px; font-size:13px; line-height:1.35; max-width:360px; }
+    .panel { position:fixed; right:12px; top:12px; width:300px; padding:12px; background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.08); border-radius:12px; }
+    .panel h3 { margin:.2rem 0 .6rem; font-size:16px; }
+    .towerBtn { width:100%; display:flex; justify-content:space-between; align-items:center; margin:8px 0; padding:10px 12px; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.08); border-radius:10px; cursor:pointer; }
+    .towerBtn.active{ outline:2px solid #69d1c5; }
+    .legend { font-size:12px; opacity:.85; }
+    .toast { position:fixed; left:50%; transform:translateX(-50%); bottom:88px; background:rgba(20,28,45,.9); border:1px solid rgba(255,255,255,.08); border-radius:10px; padding:10px 12px; display:none; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="three-root"></div>
+  <div class="hud">
+    <div class="box">💧 Litres évités: <b id="score">0</b></div>
+    <div class="box">🪙 Budget: <b id="money">200</b></div>
+    <div class="box">🌧️ Vague: <b id="wave">0</b></div>
+    <div class="box" style="gap:10px;"> Égout <div class="meter"><i id="sewerBar"></i></div> <b id="sewerPct">0%</b></div>
+    <button id="startBtn">Lancer la vague</button>
+    <button id="sellBtn" title="Vendre la tour sous le curseur (50% remboursé)">Vendre (X)</button>
+  </div>
+</div>
+<div class="hint">🎯 <b>But</b> : Empêcher les gouttes d'atteindre l'égout (au bout du chemin).<br/>
+Clique dans l'aire de jeu pour <b>placer</b> une tour sélectionnée. Chaque tour a un <b>rayon</b> visible (disque translucide).<br/>
+<b>ZQSD / Souris</b> : déplacer/viser. <b>Molette</b> : zoom. <b>X</b> : vendre la tour pointée.<br/>
+<b>Swale</b> ralentit les gouttes ; <b>Citerne</b> absorbe X L/s jusqu'à saturation.</div>
+<div class="panel">
+  <h3>Constructions</h3>
+  <div id="towerButtons"></div>
+  <div class="legend">Swale = fossé végétalisé (ralentit). Citerne = stockage (absorbe). Place-les près du chemin pour maximiser l'effet.</div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script type="module">
+// --- StormDefense Prototype 3D ---
+// Three.js via CDN (unpkg). Pour la prod, on pourra self-héberger.
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+
+// [SECTION: Global State]
+const state = {
+  running: true,
+  money: 200,
+  score: 0,
+  wave: 0,
+  sewer: { level: 0, capacity: 1000 },
+  grid: { size: 20, cell: 2 },
+  towers: [],
+  towerDefs: {
+    swale: { name: 'Swale (fossé)', cost: 50, radius: 4, slowFactor: 0.55, color: 0x66d17a },
+    cistern: { name: 'Citerne', cost: 90, radius: 3, absorbLps: 8, capacity: 300, rechargeLps: 1.5, color: 0x5ec9e6 },
+  },
+  selectedTowerKey: 'swale',
+  pathPoints: [
+    new THREE.Vector3(-16, 0, 16),
+    new THREE.Vector3(-10, 0, 10),
+    new THREE.Vector3(-8, 0, 4),
+    new THREE.Vector3(-2, 0, 0),
+    new THREE.Vector3(6, 0, -2),
+    new THREE.Vector3(12, 0, -6),
+    new THREE.Vector3(16, 0, -10),
+  ],
+  droplets: { max: 600, alive: 0, speedBase: 6, litersEach: 2 },
+};
+
+function buildWave(n){
+  const baseCount = 60 + n*20;
+  const liters = 1.2 + 0.1*n;
+  const interval = Math.max(0.06, 0.16 - n*0.01);
+  return { count: baseCount, liters, interval };
+}
+
+// [SECTION: Three.js Setup]
+const root = document.getElementById('three-root');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight-56);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+root.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1020);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth/(window.innerHeight-56), 0.1, 1000);
+camera.position.set(16, 22, 24);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0,0,0);
+controls.maxPolarAngle = Math.PI*0.49;
+controls.minDistance = 10;
+controls.maxDistance = 80;
+
+// Lights
+const hemi = new THREE.HemisphereLight(0xcdeaff, 0x0a1018, 0.9);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+dir.position.set(10, 18, 8);
+dir.castShadow = true;
+scene.add(dir);
+
+// Ground
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(80,80, 1,1),
+  new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.85, metalness: 0 })
+);
+ground.receiveShadow = true;
+ground.rotation.x = -Math.PI/2;
+scene.add(ground);
+
+// Path (tube)
+const curve = new THREE.CatmullRomCurve3([
+  new THREE.Vector3(-16, 0, 16),
+  new THREE.Vector3(-10, 0, 10),
+  new THREE.Vector3(-8, 0, 4),
+  new THREE.Vector3(-2, 0, 0),
+  new THREE.Vector3(6, 0, -2),
+  new THREE.Vector3(12, 0, -6),
+  new THREE.Vector3(16, 0, -10),
+]);
+const pathGeom = new THREE.TubeGeometry(curve, 200, 0.6, 16, false);
+const pathMat = new THREE.MeshStandardMaterial({ color: 0x324a6e, roughness:0.6, metalness:0.1 });
+const pathMesh = new THREE.Mesh(pathGeom, pathMat);
+pathMesh.castShadow = true;
+pathMesh.receiveShadow = true;
+scene.add(pathMesh);
+
+// Sewer inlet
+const sewerEnd = curve.getPoint(1);
+const sewer = new THREE.Mesh(
+  new THREE.CylinderGeometry(1.4,1.4,1.2, 24),
+  new THREE.MeshStandardMaterial({ color: 0x1d3557, metalness: 0.3, roughness:0.3 })
+);
+sewer.position.set(sewerEnd.x, 0.6, sewerEnd.z);
+scene.add(sewer);
+
+// Grid helper
+const gridHelper = new THREE.GridHelper(40, 20, 0x294058, 0x1f314a);
+scene.add(gridHelper);
+
+// Droplets
+const dropGeom = new THREE.SphereGeometry(0.25, 16, 16);
+const dropMat = new THREE.MeshPhysicalMaterial({ color: 0x57c2f6, roughness:0.15, metalness:0.0, transmission:0.5, thickness:0.8, ior:1.33, clearcoat:0.8, clearcoatRoughness:0.25 });
+const dropMesh = new THREE.InstancedMesh(dropGeom, dropMat, state.droplets.max);
+dropMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(dropMesh);
+
+const dAlive = new Array(state.droplets.max).fill(false);
+const dT = new Float32Array(state.droplets.max);
+const dSpeed = new Float32Array(state.droplets.max);
+const dummy = new THREE.Object3D();
+
+function spawnDroplet(){
+  for(let i=0;i<state.droplets.max;i++){
+    if(!dAlive[i]){
+      dAlive[i] = true; dT[i] = 0;
+      dSpeed[i] = (6 + Math.random()*1.5) * 0.04;
+      return i;
+    }
+  }
+  return -1;
+}
+function killDroplet(i){
+  if(!dAlive[i]) return;
+  dAlive[i] = false;
+  dummy.position.set(9999,9999,9999); dummy.updateMatrix(); dropMesh.setMatrixAt(i, dummy.matrix);
+}
+
+// Towers
+const towerGroup = new THREE.Group(); scene.add(towerGroup);
+class Tower {
+  constructor(def, pos){
+    this.def = def; this.pos = pos.clone();
+    this.mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.6,0.8, 1.2, 18),
+      new THREE.MeshStandardMaterial({ color: def.color, metalness:0.1, roughness:0.6 })
+    );
+    this.mesh.position.copy(this.pos.clone().add(new THREE.Vector3(0,0.6,0)));
+    this.mesh.castShadow = true; this.mesh.receiveShadow = true;
+
+    const disc = new THREE.Mesh(
+      new THREE.CircleGeometry(def.radius, 32),
+      new THREE.MeshBasicMaterial({ color: def.color, transparent:true, opacity:0.15 })
+    );
+    disc.rotation.x = -Math.PI/2; disc.position.copy(this.pos);
+    this.radiusDisc = disc;
+    towerGroup.add(this.mesh); towerGroup.add(disc);
+
+    if(def.absorbLps){
+      this.storage = 0;
+      this.cap = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.62,0.82, 0.1, 18),
+        new THREE.MeshStandardMaterial({ color: 0xbbe7ff, emissive:0x0, roughness:0.2, metalness:0.4 })
+      );
+      this.cap.position.copy(this.mesh.position.clone().add(new THREE.Vector3(0,0.65,0)));
+      towerGroup.add(this.cap);
+    }
+  }
+  update(dt){
+    if(this.def.absorbLps){
+      this.storage = Math.max(0, this.storage - this.def.rechargeLps*dt);
+      const t = this.storage / this.def.capacity;
+      const h = 0.2 + t*0.9;
+      this.cap.position.y = this.mesh.position.y - 0.6 + h;
+    }
+  }
+}
+
+function placeTower(key, pos){
+  const def = state.towerDefs[key];
+  if(state.money < def.cost){ toast("Budget insuffisant"); return null; }
+
+  const minDist = def.radius + 1.2;
+  let ok = true; let p = new THREE.Vector3();
+  for(let i=0;i<=60;i++){ curve.getPoint(i/60, p); if(p.distanceTo(pos) < minDist){ ok = false; break; } }
+  if(!ok){ toast("Trop proche du chemin"); return null; }
+
+  const tw = new Tower(def, snapToGrid(pos));
+  state.towers.push(tw);
+  state.money -= def.cost;
+  updateHUD();
+  return tw;
+}
+function sellTower(hovered){
+  if(!hovered) return;
+  const idx = state.towers.indexOf(hovered);
+  if(idx>=0){
+    const refund = Math.floor(getTowerCost(hovered)*0.5);
+    state.money += refund;
+    towerGroup.remove(hovered.mesh); towerGroup.remove(hovered.radiusDisc); if(hovered.cap) towerGroup.remove(hovered.cap);
+    state.towers.splice(idx,1);
+    updateHUD(); toast(`Tour vendue (+${refund})`);
+  }
+}
+function getTowerCost(t){ return Object.values(state.towerDefs).find(d=>d.color===t.def.color).cost || 0; }
+
+// Input & placement
+const raycaster = new THREE.Raycaster(); const mouse = new THREE.Vector2();
+let hoveredTower = null;
+renderer.domElement.addEventListener('mousemove', (e)=>{
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(towerGroup.children, true);
+  hoveredTower = null;
+  if(intersects.length){
+    const m = intersects[0].object;
+    const owner = state.towers.find(t => t.mesh === m || t.radiusDisc === m || t.cap === m);
+    if(owner) hoveredTower = owner;
+  }
+});
+renderer.domElement.addEventListener('click', (e)=>{
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObject(ground);
+  if(hits.length){
+    const p = hits[0].point;
+    placeTower(state.selectedTowerKey, p);
+  }
+});
+window.addEventListener('keydown', (e)=>{ if(e.key.toLowerCase()==='x') sellTower(hoveredTower); });
+document.getElementById('sellBtn').addEventListener('click', ()=> sellTower(hoveredTower));
+
+function snapToGrid(v){ const g = state.grid.cell; return new THREE.Vector3(Math.round(v.x/g)*g, 0, Math.round(v.z/g)*g); }
+
+// Waves
+let spawnTimer = 0; let toSpawn = 0; let spawnInterval = 0.1; let litersPerDrop = state.droplets.litersEach; let waveActive=false;
+function startWave(){
+  if(waveActive) return;
+  state.wave++;
+  const plan = buildWave(state.wave);
+  toSpawn = Math.min(plan.count, state.droplets.max-5);
+  spawnInterval = plan.interval;
+  litersPerDrop = plan.liters;
+  waveActive = true;
+  toast(`Vague ${state.wave}: ${toSpawn} gouttes, ${litersPerDrop.toFixed(1)} L/goutte`);
+  updateHUD();
+}
+
+// Simulation
+let last = performance.now();
+function tick(now){
+  const dt = Math.min(0.05, (now-last)/1000); last = now;
+  controls.update();
+
+  if(waveActive){
+    spawnTimer -= dt;
+    while(spawnTimer <= 0 && toSpawn > 0){ spawnDroplet(); toSpawn--; spawnTimer += spawnInterval; }
+    if(toSpawn<=0 && dAlive.every(a=>!a)){ waveActive=false; toast('Vague terminée ✅'); }
+  }
+
+  for(const t of state.towers) t.update(dt);
+
+  const tmp = new THREE.Vector3();
+  for(let i=0;i<state.droplets.max;i++){
+    if(!dAlive[i]) continue;
+    let spd = dSpeed[i];
+    const pos = curve.getPoint(Math.min(0.999, dT[i]));
+    for(const t of state.towers){
+      const dist = pos.distanceTo(t.pos);
+      if(dist <= t.def.radius){
+        if(t.def.slowFactor){ spd *= t.def.slowFactor; }
+        if(t.def.absorbLps && t.storage < t.def.capacity){
+          const absorb = Math.min(litersPerDrop, t.def.absorbLps*dt, t.def.capacity - t.storage);
+          if(absorb > 0){
+            t.storage += absorb;
+            const fraction = absorb / litersPerDrop;
+            dT[i] = Math.max(0, dT[i] - 0.04*fraction);
+            state.score += absorb; updateHUD_sewer();
+            if(absorb >= litersPerDrop - 1e-3){ killDroplet(i); continue; }
+          }
+        }
+      }
+    }
+    dT[i] += spd*dt;
+    if(dT[i] >= 0.999){
+      killDroplet(i);
+      state.sewer.level += litersPerDrop;
+      updateHUD_sewer();
+      if(state.sewer.level >= state.sewer.capacity){ gameOver(); }
+      continue;
+    }
+    curve.getPoint(dT[i], tmp);
+    const bob = Math.sin(now*0.01 + i)*0.06;
+    dummy.position.set(tmp.x, 0.25 + bob, tmp.z);
+    const rot = (now*0.0008 + i)*Math.PI*2; dummy.rotation.set(0, rot, 0); dummy.updateMatrix();
+    dropMesh.setMatrixAt(i, dummy.matrix);
+  }
+  dropMesh.instanceMatrix.needsUpdate = true;
+
+  renderer.render(scene, camera);
+  if(state.running) requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+function gameOver(){
+  state.running = false; toast('💥 Égout débordé — Partie terminée'); document.getElementById('startBtn').disabled = true;
+}
+
+// HUD
+const moneyEl = document.getElementById('money');
+const scoreEl = document.getElementById('score');
+const waveEl = document.getElementById('wave');
+const sewerBar = document.getElementById('sewerBar');
+const sewerPct = document.getElementById('sewerPct');
+function updateHUD(){ moneyEl.textContent = Math.floor(state.money); scoreEl.textContent = Math.floor(state.score); waveEl.textContent = state.wave; updateHUD_sewer(); }
+function updateHUD_sewer(){ const pct = Math.min(100, Math.floor(100*state.sewer.level/state.sewer.capacity)); sewerBar.style.width = pct + '%'; sewerPct.textContent = pct + '%'; }
+
+const towerButtons = document.getElementById('towerButtons');
+function rebuildTowerButtons(){
+  towerButtons.innerHTML = '';
+  Object.entries(state.towerDefs).forEach(([key,def])=>{
+    const btn = document.createElement('div'); btn.className = 'towerBtn'; btn.dataset.key = key;
+    btn.innerHTML = `<div><b>${def.name}</b><div style="font-size:12px;opacity:.8;">${def.slowFactor?`Ralentit ×${def.slowFactor}`:''}${def.absorbLps?`Absorbe ${def.absorbLps} L/s`:''} — Rayon ${def.radius}m</div></div><div>💰 ${def.cost}</div>`;
+    btn.addEventListener('click',()=>{ state.selectedTowerKey = key; refreshActive(); });
+    towerButtons.appendChild(btn);
+  });
+  refreshActive();
+}
+function refreshActive(){ document.querySelectorAll('.towerBtn').forEach(el=>{ el.classList.toggle('active', el.dataset.key === state.selectedTowerKey); }); }
+rebuildTowerButtons();
+
+const startBtn = document.getElementById('startBtn'); startBtn.addEventListener('click', ()=> startWave());
+window.addEventListener('resize', ()=>{ renderer.setSize(window.innerWidth, window.innerHeight-56); camera.aspect = window.innerWidth/(window.innerHeight-56); camera.updateProjectionMatrix(); });
+
+const toastEl = document.getElementById('toast'); let toastTimer=0;
+function toast(msg){ toastEl.textContent = msg; toastEl.style.display='block'; clearTimeout(toastTimer); toastTimer = setTimeout(()=> toastEl.style.display='none', 2000); }
+
+window.addEventListener('keydown',(e)=>{ if(e.key.toLowerCase()==='c'){ state.money+=100; updateHUD(); toast('+100'); } });
+updateHUD();
+</script>
+</body>
+</html>
